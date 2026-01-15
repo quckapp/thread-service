@@ -75,7 +75,7 @@ func main() {
 	_ = godotenv.Load()
 
 	var err error
-	db, err = sqlx.Connect("mysql", getEnv("DATABASE_URL", "root:password@tcp(localhost:3306)/quckchat_threads?parseTime=true"))
+	db, err = sqlx.Connect("mysql", getEnv("DATABASE_URL", "root:password@tcp(localhost:3306)/quckapp_threads?parseTime=true"))
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}

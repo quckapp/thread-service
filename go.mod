@@ -1,4 +1,4 @@
-module github.com/quckchat/thread-service
+module github.com/quckapp/thread-service
 
 go 1.22
 
