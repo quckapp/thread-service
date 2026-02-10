@@ -2,92 +2,43 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/joho/godotenv"
 	"github.com/segmentio/kafka-go"
 	"github.com/sirupsen/logrus"
-)
 
-// Thread represents a conversation thread
-type Thread struct {
-	ID               string     `json:"id" db:"id"`
-	ChannelID        string     `json:"channel_id" db:"channel_id"`
-	ParentMessageID  string     `json:"parent_message_id" db:"parent_message_id"`
-	CreatedBy        string     `json:"created_by" db:"created_by"`
-	ReplyCount       int        `json:"reply_count" db:"reply_count"`
-	ParticipantCount int        `json:"participant_count" db:"participant_count"`
-	LastReplyAt      *time.Time `json:"last_reply_at" db:"last_reply_at"`
-	LastReplyBy      *string    `json:"last_reply_by" db:"last_reply_by"`
-	IsResolved       bool       `json:"is_resolved" db:"is_resolved"`
-	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at" db:"updated_at"`
-}
-
-// ThreadReply represents a reply in a thread
-type ThreadReply struct {
-	ID        string    `json:"id" db:"id"`
-	ThreadID  string    `json:"thread_id" db:"thread_id"`
-	MessageID string    `json:"message_id" db:"message_id"`
-	UserID    string    `json:"user_id" db:"user_id"`
-	CreatedAt time.Time `json:"created_at" db:"created_at"`
-}
-
-// ThreadParticipant represents a user participating in a thread
-type ThreadParticipant struct {
-	ID           string     `json:"id" db:"id"`
-	ThreadID     string     `json:"thread_id" db:"thread_id"`
-	UserID       string     `json:"user_id" db:"user_id"`
-	LastReadAt   *time.Time `json:"last_read_at" db:"last_read_at"`
-	IsSubscribed bool       `json:"is_subscribed" db:"is_subscribed"`
-	JoinedAt     time.Time  `json:"joined_at" db:"joined_at"`
-}
-
-// ThreadEvent for Kafka publishing
-type ThreadEvent struct {
-	Type      string      `json:"type"`
-	ThreadID  string      `json:"thread_id"`
-	ChannelID string      `json:"channel_id"`
-	UserID    string      `json:"user_id"`
-	Data      interface{} `json:"data"`
-	Timestamp time.Time   `json:"timestamp"`
-}
-
-var (
-	db          *sqlx.DB
-	log         *logrus.Logger
-	kafkaWriter *kafka.Writer
+	"github.com/quckapp/thread-service/internal/api"
+	"github.com/quckapp/thread-service/internal/repository"
+	"github.com/quckapp/thread-service/internal/service"
 )
 
 func main() {
-	log = logrus.New()
+	log := logrus.New()
 	log.SetFormatter(&logrus.JSONFormatter{})
 	_ = godotenv.Load()
 
-	var err error
-	db, err = sqlx.Connect("mysql", getEnv("DATABASE_URL", "root:password@tcp(localhost:3306)/quckapp_threads?parseTime=true"))
+	db, err := sqlx.Connect("mysql", getEnv("DATABASE_URL", "root:password@tcp(localhost:3306)/quckapp_threads?parseTime=true"))
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer db.Close()
 
-	// Configure connection pool
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
+	// Run migrations
+	runMigrations(db, log)
+
 	// Initialize Kafka writer
-	kafkaWriter = &kafka.Writer{
+	kafkaWriter := &kafka.Writer{
 		Addr:         kafka.TCP(getEnv("KAFKA_BROKERS", "localhost:9092")),
 		Topic:        getEnv("KAFKA_TOPIC", "thread-events"),
 		Balancer:     &kafka.LeastBytes{},
@@ -95,50 +46,43 @@ func main() {
 	}
 	defer kafkaWriter.Close()
 
-	r := gin.New()
-	r.Use(gin.Recovery())
-	r.Use(requestLogger())
+	// Initialize repositories
+	threadRepo := repository.NewThreadRepository(db)
+	replyRepo := repository.NewReplyRepository(db)
+	participantRepo := repository.NewParticipantRepository(db)
+	labelRepo := repository.NewLabelRepository(db)
+	bookmarkRepo := repository.NewBookmarkRepository(db)
+	reactionRepo := repository.NewReactionRepository(db)
+	pollRepo := repository.NewPollRepository(db)
+	draftRepo := repository.NewDraftRepository(db)
+	mentionRepo := repository.NewMentionRepository(db)
+	assignmentRepo := repository.NewAssignmentRepository(db)
+	activityRepo := repository.NewActivityRepository(db)
+	attachmentRepo := repository.NewAttachmentRepository(db)
+	templateRepo := repository.NewTemplateRepository(db)
+	followUpRepo := repository.NewFollowUpRepository(db)
+	summaryRepo := repository.NewSummaryRepository(db)
+	linkRepo := repository.NewLinkRepository(db)
 
-	// Health checks
-	r.GET("/health", healthCheck)
-	r.GET("/ready", readinessCheck)
+	// Initialize service
+	svc := service.NewThreadService(
+		threadRepo, replyRepo, participantRepo,
+		labelRepo, bookmarkRepo, reactionRepo,
+		pollRepo, draftRepo, mentionRepo,
+		assignmentRepo, activityRepo, attachmentRepo,
+		templateRepo, followUpRepo, summaryRepo,
+		linkRepo, kafkaWriter, log,
+	)
 
-	api := r.Group("/api/v1")
-	{
-		// Thread management
-		threads := api.Group("/threads")
-		{
-			threads.POST("", createThread)
-			threads.GET("", listThreads)
-			threads.GET("/:id", getThread)
-			threads.PUT("/:id", updateThread)
-			threads.DELETE("/:id", deleteThread)
-			threads.GET("/message/:messageId", getThreadByMessage)
-			threads.GET("/channel/:channelId", getChannelThreads)
+	// Initialize handler
+	handler := api.NewHandler(svc)
 
-			// Replies
-			threads.GET("/:id/replies", getThreadReplies)
-			threads.POST("/:id/replies", addReply)
-			threads.DELETE("/:id/replies/:replyId", deleteReply)
+	// Setup router
+	r := api.SetupRouter(db, handler, log)
 
-			// Participants
-			threads.GET("/:id/participants", getParticipants)
-			threads.POST("/:id/participants", addParticipant)
-			threads.DELETE("/:id/participants/:userId", removeParticipant)
-			threads.PUT("/:id/participants/:userId/subscribe", updateSubscription)
-			threads.POST("/:id/participants/:userId/read", markAsRead)
-		}
-
-		// User's threads
-		api.GET("/users/:userId/threads", getUserThreads)
-
-		// Stats
-		api.GET("/stats", getStats)
-	}
-
-	srv := &http.Server{Addr: ":" + getEnv("PORT", "3005"), Handler: r}
+	srv := &http.Server{Addr: ":" + getEnv("PORT", "5009"), Handler: r}
 	go func() {
-		log.Infof("Thread service starting on port %s", getEnv("PORT", "3005"))
+		log.Infof("Thread service starting on port %s", getEnv("PORT", "5009"))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
 		}
@@ -165,743 +109,218 @@ func getEnv(key, def string) string {
 	return def
 }
 
-func requestLogger() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		start := time.Now()
-		c.Next()
-		log.WithFields(logrus.Fields{
-			"method":   c.Request.Method,
-			"path":     c.Request.URL.Path,
-			"status":   c.Writer.Status(),
-			"duration": time.Since(start).Milliseconds(),
-		}).Info("request")
-	}
-}
-
-// Health checks
-func healthCheck(c *gin.Context) {
-	c.JSON(200, gin.H{
-		"status":  "healthy",
-		"service": "thread-service",
-		"time":    time.Now().UTC(),
-	})
-}
-
-func readinessCheck(c *gin.Context) {
-	if err := db.Ping(); err != nil {
-		c.JSON(503, gin.H{"status": "not ready", "error": "database unavailable"})
-		return
-	}
-	c.JSON(200, gin.H{"status": "ready"})
-}
-
-// Thread handlers
-func createThread(c *gin.Context) {
-	var req struct {
-		ChannelID       string `json:"channel_id" binding:"required"`
-		ParentMessageID string `json:"parent_message_id" binding:"required"`
-		CreatedBy       string `json:"created_by" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Check if thread already exists for this message
-	var existingID string
-	err := db.Get(&existingID, `SELECT id FROM threads WHERE parent_message_id = ?`, req.ParentMessageID)
-	if err == nil {
-		c.JSON(409, gin.H{"error": "thread already exists for this message", "thread_id": existingID})
-		return
-	}
-
-	threadID := uuid.New().String()
-	now := time.Now()
-
-	tx, err := db.Beginx()
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to start transaction"})
-		return
-	}
-	defer tx.Rollback()
-
-	// Create thread
-	_, err = tx.Exec(`INSERT INTO threads (id, channel_id, parent_message_id, created_by, reply_count, participant_count, is_resolved, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 0, 1, FALSE, ?, ?)`,
-		threadID, req.ChannelID, req.ParentMessageID, req.CreatedBy, now, now)
-	if err != nil {
-		log.Errorf("Failed to create thread: %v", err)
-		c.JSON(500, gin.H{"error": "failed to create thread"})
-		return
-	}
-
-	// Add creator as first participant
-	participantID := uuid.New().String()
-	_, err = tx.Exec(`INSERT INTO thread_participants (id, thread_id, user_id, is_subscribed, joined_at)
-		VALUES (?, ?, ?, TRUE, ?)`,
-		participantID, threadID, req.CreatedBy, now)
-	if err != nil {
-		log.Errorf("Failed to add creator as participant: %v", err)
-		c.JSON(500, gin.H{"error": "failed to create thread"})
-		return
-	}
-
-	if err := tx.Commit(); err != nil {
-		c.JSON(500, gin.H{"error": "failed to commit transaction"})
-		return
-	}
-
-	// Publish event
-	publishEvent(ThreadEvent{
-		Type:      "thread.created",
-		ThreadID:  threadID,
-		ChannelID: req.ChannelID,
-		UserID:    req.CreatedBy,
-		Data: map[string]interface{}{
-			"parent_message_id": req.ParentMessageID,
-		},
-		Timestamp: now,
-	})
-
-	log.WithFields(logrus.Fields{"thread_id": threadID, "channel_id": req.ChannelID}).Info("Thread created")
-
-	thread := Thread{
-		ID:               threadID,
-		ChannelID:        req.ChannelID,
-		ParentMessageID:  req.ParentMessageID,
-		CreatedBy:        req.CreatedBy,
-		ReplyCount:       0,
-		ParticipantCount: 1,
-		IsResolved:       false,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-	}
-	c.JSON(201, thread)
-}
-
-func getThread(c *gin.Context) {
-	id := c.Param("id")
-
-	var thread Thread
-	err := db.Get(&thread, `SELECT * FROM threads WHERE id = ?`, id)
-	if err != nil {
-		c.JSON(404, gin.H{"error": "thread not found"})
-		return
-	}
-	c.JSON(200, thread)
-}
-
-func getThreadByMessage(c *gin.Context) {
-	messageID := c.Param("messageId")
-
-	var thread Thread
-	err := db.Get(&thread, `SELECT * FROM threads WHERE parent_message_id = ?`, messageID)
-	if err != nil {
-		c.JSON(404, gin.H{"error": "thread not found"})
-		return
-	}
-	c.JSON(200, thread)
-}
-
-func listThreads(c *gin.Context) {
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
-
-	if limit > 100 {
-		limit = 100
-	}
-
-	var threads []Thread
-	err := db.Select(&threads, `SELECT * FROM threads ORDER BY updated_at DESC LIMIT ? OFFSET ?`, limit, offset)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to fetch threads"})
-		return
-	}
-
-	var total int
-	db.Get(&total, `SELECT COUNT(*) FROM threads`)
-
-	c.JSON(200, gin.H{
-		"threads": threads,
-		"total":   total,
-		"limit":   limit,
-		"offset":  offset,
-	})
-}
-
-func getChannelThreads(c *gin.Context) {
-	channelID := c.Param("channelId")
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
-	includeResolved := c.DefaultQuery("include_resolved", "true") == "true"
-
-	if limit > 100 {
-		limit = 100
-	}
-
-	query := `SELECT * FROM threads WHERE channel_id = ?`
-	countQuery := `SELECT COUNT(*) FROM threads WHERE channel_id = ?`
-	args := []interface{}{channelID}
-
-	if !includeResolved {
-		query += ` AND is_resolved = FALSE`
-		countQuery += ` AND is_resolved = FALSE`
-	}
-
-	query += ` ORDER BY COALESCE(last_reply_at, created_at) DESC LIMIT ? OFFSET ?`
-	args = append(args, limit, offset)
-
-	var threads []Thread
-	err := db.Select(&threads, query, args...)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to fetch threads"})
-		return
-	}
-
-	var total int
-	if includeResolved {
-		db.Get(&total, countQuery, channelID)
-	} else {
-		db.Get(&total, countQuery, channelID)
-	}
-
-	c.JSON(200, gin.H{
-		"threads": threads,
-		"total":   total,
-		"limit":   limit,
-		"offset":  offset,
-	})
-}
-
-func getUserThreads(c *gin.Context) {
-	userID := c.Param("userId")
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
-	subscribedOnly := c.DefaultQuery("subscribed_only", "false") == "true"
-
-	if limit > 100 {
-		limit = 100
+func runMigrations(db *sqlx.DB, log *logrus.Logger) {
+	tables := []string{
+		`CREATE TABLE IF NOT EXISTS threads (
+			id VARCHAR(36) PRIMARY KEY,
+			channel_id VARCHAR(36) NOT NULL,
+			parent_message_id VARCHAR(36) NOT NULL,
+			created_by VARCHAR(36) NOT NULL,
+			title VARCHAR(500) DEFAULT '',
+			reply_count INT DEFAULT 0,
+			participant_count INT DEFAULT 0,
+			last_reply_at DATETIME NULL,
+			last_reply_by VARCHAR(36) NULL,
+			is_resolved BOOLEAN DEFAULT FALSE,
+			is_pinned BOOLEAN DEFAULT FALSE,
+			is_locked BOOLEAN DEFAULT FALSE,
+			is_archived BOOLEAN DEFAULT FALSE,
+			priority VARCHAR(20) DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			INDEX idx_channel (channel_id),
+			INDEX idx_message (parent_message_id),
+			INDEX idx_created_by (created_by),
+			INDEX idx_resolved (is_resolved)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_replies (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			message_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			content TEXT DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			INDEX idx_thread (thread_id),
+			INDEX idx_user (user_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_participants (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			last_read_at DATETIME NULL,
+			is_subscribed BOOLEAN DEFAULT TRUE,
+			joined_at DATETIME NOT NULL,
+			INDEX idx_thread_user (thread_id, user_id),
+			INDEX idx_user (user_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_labels (
+			id VARCHAR(36) PRIMARY KEY,
+			name VARCHAR(100) NOT NULL,
+			color VARCHAR(20) NOT NULL,
+			channel_id VARCHAR(36) NOT NULL,
+			created_by VARCHAR(36) NOT NULL,
+			created_at DATETIME NOT NULL,
+			INDEX idx_channel (channel_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_label_assignments (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			label_id VARCHAR(36) NOT NULL,
+			assigned_by VARCHAR(36) NOT NULL,
+			assigned_at DATETIME NOT NULL,
+			INDEX idx_thread (thread_id),
+			INDEX idx_label (label_id),
+			UNIQUE INDEX idx_thread_label (thread_id, label_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_bookmarks (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			note TEXT DEFAULT '',
+			created_at DATETIME NOT NULL,
+			UNIQUE INDEX idx_thread_user (thread_id, user_id),
+			INDEX idx_user (user_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_reactions (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			reply_id VARCHAR(36) DEFAULT '',
+			user_id VARCHAR(36) NOT NULL,
+			emoji VARCHAR(50) NOT NULL,
+			created_at DATETIME NOT NULL,
+			INDEX idx_thread (thread_id),
+			INDEX idx_reply (reply_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_polls (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			question VARCHAR(500) NOT NULL,
+			created_by VARCHAR(36) NOT NULL,
+			multi_vote BOOLEAN DEFAULT FALSE,
+			anonymous BOOLEAN DEFAULT FALSE,
+			expires_at DATETIME NULL,
+			is_closed BOOLEAN DEFAULT FALSE,
+			created_at DATETIME NOT NULL,
+			INDEX idx_thread (thread_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS poll_options (
+			id VARCHAR(36) PRIMARY KEY,
+			poll_id VARCHAR(36) NOT NULL,
+			text VARCHAR(500) NOT NULL,
+			position INT DEFAULT 0,
+			INDEX idx_poll (poll_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS poll_votes (
+			id VARCHAR(36) PRIMARY KEY,
+			poll_id VARCHAR(36) NOT NULL,
+			option_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			voted_at DATETIME NOT NULL,
+			INDEX idx_poll (poll_id),
+			INDEX idx_option (option_id),
+			INDEX idx_user (user_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_drafts (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			content TEXT NOT NULL,
+			updated_at DATETIME NOT NULL,
+			UNIQUE INDEX idx_thread_user (thread_id, user_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_mentions (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			reply_id VARCHAR(36) DEFAULT '',
+			mentioned_user VARCHAR(36) NOT NULL,
+			mentioned_by VARCHAR(36) NOT NULL,
+			is_read BOOLEAN DEFAULT FALSE,
+			created_at DATETIME NOT NULL,
+			INDEX idx_mentioned (mentioned_user),
+			INDEX idx_unread (mentioned_user, is_read)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_assignments (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			assignee_id VARCHAR(36) NOT NULL,
+			assigned_by VARCHAR(36) NOT NULL,
+			status VARCHAR(20) DEFAULT 'open',
+			due_date DATETIME NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			INDEX idx_thread (thread_id),
+			INDEX idx_assignee (assignee_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_activity_log (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			action VARCHAR(100) NOT NULL,
+			details TEXT DEFAULT '',
+			created_at DATETIME NOT NULL,
+			INDEX idx_thread (thread_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_attachments (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			reply_id VARCHAR(36) DEFAULT '',
+			user_id VARCHAR(36) NOT NULL,
+			file_name VARCHAR(500) NOT NULL,
+			file_size BIGINT DEFAULT 0,
+			mime_type VARCHAR(100) DEFAULT '',
+			url VARCHAR(2000) NOT NULL,
+			created_at DATETIME NOT NULL,
+			INDEX idx_thread (thread_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_templates (
+			id VARCHAR(36) PRIMARY KEY,
+			channel_id VARCHAR(36) NOT NULL,
+			name VARCHAR(200) NOT NULL,
+			description TEXT DEFAULT '',
+			content TEXT DEFAULT '',
+			labels TEXT DEFAULT '',
+			priority VARCHAR(20) DEFAULT '',
+			created_by VARCHAR(36) NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			INDEX idx_channel (channel_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_follow_ups (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			remind_at DATETIME NOT NULL,
+			note TEXT DEFAULT '',
+			is_triggered BOOLEAN DEFAULT FALSE,
+			created_at DATETIME NOT NULL,
+			INDEX idx_user (user_id),
+			INDEX idx_remind (remind_at, is_triggered)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_summaries (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			summary TEXT NOT NULL,
+			created_by VARCHAR(36) NOT NULL,
+			created_at DATETIME NOT NULL,
+			INDEX idx_thread (thread_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_links (
+			id VARCHAR(36) PRIMARY KEY,
+			source_thread VARCHAR(36) NOT NULL,
+			target_thread VARCHAR(36) NOT NULL,
+			link_type VARCHAR(50) DEFAULT 'related',
+			created_by VARCHAR(36) NOT NULL,
+			created_at DATETIME NOT NULL,
+			INDEX idx_source (source_thread),
+			INDEX idx_target (target_thread)
+		)`,
 	}
 
-	query := `SELECT t.* FROM threads t
-		INNER JOIN thread_participants tp ON t.id = tp.thread_id
-		WHERE tp.user_id = ?`
-	args := []interface{}{userID}
-
-	if subscribedOnly {
-		query += ` AND tp.is_subscribed = TRUE`
-	}
-
-	query += ` ORDER BY COALESCE(t.last_reply_at, t.created_at) DESC LIMIT ? OFFSET ?`
-	args = append(args, limit, offset)
-
-	var threads []Thread
-	err := db.Select(&threads, query, args...)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to fetch threads"})
-		return
-	}
-
-	c.JSON(200, gin.H{
-		"threads": threads,
-		"limit":   limit,
-		"offset":  offset,
-	})
-}
-
-func updateThread(c *gin.Context) {
-	id := c.Param("id")
-
-	var thread Thread
-	if err := db.Get(&thread, `SELECT * FROM threads WHERE id = ?`, id); err != nil {
-		c.JSON(404, gin.H{"error": "thread not found"})
-		return
-	}
-
-	var req struct {
-		IsResolved *bool `json:"is_resolved"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	if req.IsResolved != nil {
-		_, err := db.Exec(`UPDATE threads SET is_resolved = ?, updated_at = NOW() WHERE id = ?`, *req.IsResolved, id)
-		if err != nil {
-			c.JSON(500, gin.H{"error": "failed to update thread"})
-			return
-		}
-
-		eventType := "thread.resolved"
-		if !*req.IsResolved {
-			eventType = "thread.reopened"
-		}
-
-		publishEvent(ThreadEvent{
-			Type:      eventType,
-			ThreadID:  id,
-			ChannelID: thread.ChannelID,
-			Data: map[string]interface{}{
-				"is_resolved": *req.IsResolved,
-			},
-			Timestamp: time.Now(),
-		})
-	}
-
-	// Fetch updated thread
-	db.Get(&thread, `SELECT * FROM threads WHERE id = ?`, id)
-	c.JSON(200, thread)
-}
-
-func deleteThread(c *gin.Context) {
-	id := c.Param("id")
-
-	var thread Thread
-	if err := db.Get(&thread, `SELECT * FROM threads WHERE id = ?`, id); err != nil {
-		c.JSON(404, gin.H{"error": "thread not found"})
-		return
-	}
-
-	result, err := db.Exec(`DELETE FROM threads WHERE id = ?`, id)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to delete thread"})
-		return
-	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		c.JSON(404, gin.H{"error": "thread not found"})
-		return
-	}
-
-	publishEvent(ThreadEvent{
-		Type:      "thread.deleted",
-		ThreadID:  id,
-		ChannelID: thread.ChannelID,
-		Timestamp: time.Now(),
-	})
-
-	log.WithField("thread_id", id).Info("Thread deleted")
-	c.JSON(200, gin.H{"message": "thread deleted"})
-}
-
-// Reply handlers
-func getThreadReplies(c *gin.Context) {
-	threadID := c.Param("id")
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
-	order := c.DefaultQuery("order", "asc")
-
-	if limit > 100 {
-		limit = 100
-	}
-
-	orderDir := "ASC"
-	if order == "desc" {
-		orderDir = "DESC"
-	}
-
-	var replies []ThreadReply
-	query := `SELECT * FROM thread_replies WHERE thread_id = ? ORDER BY created_at ` + orderDir + ` LIMIT ? OFFSET ?`
-	err := db.Select(&replies, query, threadID, limit, offset)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to fetch replies"})
-		return
-	}
-
-	var total int
-	db.Get(&total, `SELECT COUNT(*) FROM thread_replies WHERE thread_id = ?`, threadID)
-
-	c.JSON(200, gin.H{
-		"replies": replies,
-		"total":   total,
-		"limit":   limit,
-		"offset":  offset,
-	})
-}
-
-func addReply(c *gin.Context) {
-	threadID := c.Param("id")
-
-	var thread Thread
-	if err := db.Get(&thread, `SELECT * FROM threads WHERE id = ?`, threadID); err != nil {
-		c.JSON(404, gin.H{"error": "thread not found"})
-		return
-	}
-
-	var req struct {
-		MessageID string `json:"message_id" binding:"required"`
-		UserID    string `json:"user_id" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	replyID := uuid.New().String()
-	now := time.Now()
-
-	tx, err := db.Beginx()
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to start transaction"})
-		return
-	}
-	defer tx.Rollback()
-
-	// Insert reply
-	_, err = tx.Exec(`INSERT INTO thread_replies (id, thread_id, message_id, user_id, created_at)
-		VALUES (?, ?, ?, ?, ?)`,
-		replyID, threadID, req.MessageID, req.UserID, now)
-	if err != nil {
-		log.Errorf("Failed to add reply: %v", err)
-		c.JSON(500, gin.H{"error": "failed to add reply"})
-		return
-	}
-
-	// Update thread metadata
-	_, err = tx.Exec(`UPDATE threads SET reply_count = reply_count + 1, last_reply_at = ?, last_reply_by = ?, updated_at = ?
-		WHERE id = ?`, now, req.UserID, now, threadID)
-	if err != nil {
-		log.Errorf("Failed to update thread: %v", err)
-		c.JSON(500, gin.H{"error": "failed to update thread"})
-		return
-	}
-
-	// Add user as participant if not already
-	var existingParticipant int
-	tx.Get(&existingParticipant, `SELECT COUNT(*) FROM thread_participants WHERE thread_id = ? AND user_id = ?`,
-		threadID, req.UserID)
-
-	if existingParticipant == 0 {
-		participantID := uuid.New().String()
-		_, err = tx.Exec(`INSERT INTO thread_participants (id, thread_id, user_id, is_subscribed, joined_at)
-			VALUES (?, ?, ?, TRUE, ?)`,
-			participantID, threadID, req.UserID, now)
-		if err != nil {
-			log.Errorf("Failed to add participant: %v", err)
-		} else {
-			// Update participant count
-			tx.Exec(`UPDATE threads SET participant_count = participant_count + 1 WHERE id = ?`, threadID)
+	for _, stmt := range tables {
+		if _, err := db.Exec(stmt); err != nil {
+			log.Warnf("Migration warning: %v", err)
 		}
 	}
-
-	// Update last read for the replying user
-	tx.Exec(`UPDATE thread_participants SET last_read_at = ? WHERE thread_id = ? AND user_id = ?`,
-		now, threadID, req.UserID)
-
-	if err := tx.Commit(); err != nil {
-		c.JSON(500, gin.H{"error": "failed to commit transaction"})
-		return
-	}
-
-	// Publish event
-	publishEvent(ThreadEvent{
-		Type:      "thread.reply.added",
-		ThreadID:  threadID,
-		ChannelID: thread.ChannelID,
-		UserID:    req.UserID,
-		Data: map[string]interface{}{
-			"reply_id":   replyID,
-			"message_id": req.MessageID,
-		},
-		Timestamp: now,
-	})
-
-	log.WithFields(logrus.Fields{"thread_id": threadID, "reply_id": replyID}).Info("Reply added")
-
-	reply := ThreadReply{
-		ID:        replyID,
-		ThreadID:  threadID,
-		MessageID: req.MessageID,
-		UserID:    req.UserID,
-		CreatedAt: now,
-	}
-	c.JSON(201, reply)
-}
-
-func deleteReply(c *gin.Context) {
-	threadID := c.Param("id")
-	replyID := c.Param("replyId")
-
-	var reply ThreadReply
-	if err := db.Get(&reply, `SELECT * FROM thread_replies WHERE id = ? AND thread_id = ?`, replyID, threadID); err != nil {
-		c.JSON(404, gin.H{"error": "reply not found"})
-		return
-	}
-
-	tx, err := db.Beginx()
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to start transaction"})
-		return
-	}
-	defer tx.Rollback()
-
-	// Delete reply
-	_, err = tx.Exec(`DELETE FROM thread_replies WHERE id = ?`, replyID)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to delete reply"})
-		return
-	}
-
-	// Update thread reply count
-	tx.Exec(`UPDATE threads SET reply_count = reply_count - 1, updated_at = NOW() WHERE id = ?`, threadID)
-
-	// Update last_reply_at and last_reply_by if this was the last reply
-	var lastReply ThreadReply
-	err = tx.Get(&lastReply, `SELECT * FROM thread_replies WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1`, threadID)
-	if err != nil {
-		// No more replies
-		tx.Exec(`UPDATE threads SET last_reply_at = NULL, last_reply_by = NULL WHERE id = ?`, threadID)
-	} else {
-		tx.Exec(`UPDATE threads SET last_reply_at = ?, last_reply_by = ? WHERE id = ?`,
-			lastReply.CreatedAt, lastReply.UserID, threadID)
-	}
-
-	if err := tx.Commit(); err != nil {
-		c.JSON(500, gin.H{"error": "failed to commit transaction"})
-		return
-	}
-
-	log.WithFields(logrus.Fields{"thread_id": threadID, "reply_id": replyID}).Info("Reply deleted")
-	c.JSON(200, gin.H{"message": "reply deleted"})
-}
-
-// Participant handlers
-func getParticipants(c *gin.Context) {
-	threadID := c.Param("id")
-
-	var participants []ThreadParticipant
-	err := db.Select(&participants, `SELECT * FROM thread_participants WHERE thread_id = ? ORDER BY joined_at ASC`, threadID)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to fetch participants"})
-		return
-	}
-
-	c.JSON(200, gin.H{"participants": participants})
-}
-
-func addParticipant(c *gin.Context) {
-	threadID := c.Param("id")
-
-	var thread Thread
-	if err := db.Get(&thread, `SELECT * FROM threads WHERE id = ?`, threadID); err != nil {
-		c.JSON(404, gin.H{"error": "thread not found"})
-		return
-	}
-
-	var req struct {
-		UserID string `json:"user_id" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Check if already participant
-	var existing int
-	db.Get(&existing, `SELECT COUNT(*) FROM thread_participants WHERE thread_id = ? AND user_id = ?`, threadID, req.UserID)
-	if existing > 0 {
-		c.JSON(409, gin.H{"error": "user is already a participant"})
-		return
-	}
-
-	participantID := uuid.New().String()
-	now := time.Now()
-
-	tx, err := db.Beginx()
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to start transaction"})
-		return
-	}
-	defer tx.Rollback()
-
-	_, err = tx.Exec(`INSERT INTO thread_participants (id, thread_id, user_id, is_subscribed, joined_at)
-		VALUES (?, ?, ?, TRUE, ?)`,
-		participantID, threadID, req.UserID, now)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to add participant"})
-		return
-	}
-
-	tx.Exec(`UPDATE threads SET participant_count = participant_count + 1, updated_at = NOW() WHERE id = ?`, threadID)
-
-	if err := tx.Commit(); err != nil {
-		c.JSON(500, gin.H{"error": "failed to commit transaction"})
-		return
-	}
-
-	publishEvent(ThreadEvent{
-		Type:      "thread.participant.added",
-		ThreadID:  threadID,
-		ChannelID: thread.ChannelID,
-		UserID:    req.UserID,
-		Timestamp: now,
-	})
-
-	participant := ThreadParticipant{
-		ID:           participantID,
-		ThreadID:     threadID,
-		UserID:       req.UserID,
-		IsSubscribed: true,
-		JoinedAt:     now,
-	}
-	c.JSON(201, participant)
-}
-
-func removeParticipant(c *gin.Context) {
-	threadID := c.Param("id")
-	userID := c.Param("userId")
-
-	var thread Thread
-	if err := db.Get(&thread, `SELECT * FROM threads WHERE id = ?`, threadID); err != nil {
-		c.JSON(404, gin.H{"error": "thread not found"})
-		return
-	}
-
-	// Can't remove the creator
-	if thread.CreatedBy == userID {
-		c.JSON(400, gin.H{"error": "cannot remove thread creator"})
-		return
-	}
-
-	tx, err := db.Beginx()
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to start transaction"})
-		return
-	}
-	defer tx.Rollback()
-
-	result, err := tx.Exec(`DELETE FROM thread_participants WHERE thread_id = ? AND user_id = ?`, threadID, userID)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to remove participant"})
-		return
-	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		c.JSON(404, gin.H{"error": "participant not found"})
-		return
-	}
-
-	tx.Exec(`UPDATE threads SET participant_count = participant_count - 1, updated_at = NOW() WHERE id = ?`, threadID)
-
-	if err := tx.Commit(); err != nil {
-		c.JSON(500, gin.H{"error": "failed to commit transaction"})
-		return
-	}
-
-	publishEvent(ThreadEvent{
-		Type:      "thread.participant.removed",
-		ThreadID:  threadID,
-		ChannelID: thread.ChannelID,
-		UserID:    userID,
-		Timestamp: time.Now(),
-	})
-
-	c.JSON(200, gin.H{"message": "participant removed"})
-}
-
-func updateSubscription(c *gin.Context) {
-	threadID := c.Param("id")
-	userID := c.Param("userId")
-
-	var req struct {
-		IsSubscribed bool `json:"is_subscribed"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	result, err := db.Exec(`UPDATE thread_participants SET is_subscribed = ? WHERE thread_id = ? AND user_id = ?`,
-		req.IsSubscribed, threadID, userID)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to update subscription"})
-		return
-	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		c.JSON(404, gin.H{"error": "participant not found"})
-		return
-	}
-
-	c.JSON(200, gin.H{"message": "subscription updated", "is_subscribed": req.IsSubscribed})
-}
-
-func markAsRead(c *gin.Context) {
-	threadID := c.Param("id")
-	userID := c.Param("userId")
-
-	now := time.Now()
-	result, err := db.Exec(`UPDATE thread_participants SET last_read_at = ? WHERE thread_id = ? AND user_id = ?`,
-		now, threadID, userID)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to mark as read"})
-		return
-	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		c.JSON(404, gin.H{"error": "participant not found"})
-		return
-	}
-
-	c.JSON(200, gin.H{"message": "marked as read", "last_read_at": now})
-}
-
-// Stats
-func getStats(c *gin.Context) {
-	var stats struct {
-		TotalThreads    int `db:"total_threads"`
-		ActiveThreads   int `db:"active_threads"`
-		ResolvedThreads int `db:"resolved_threads"`
-		TotalReplies    int `db:"total_replies"`
-		TotalParticipants int `db:"total_participants"`
-	}
-
-	db.Get(&stats.TotalThreads, `SELECT COUNT(*) FROM threads`)
-	db.Get(&stats.ActiveThreads, `SELECT COUNT(*) FROM threads WHERE is_resolved = FALSE`)
-	db.Get(&stats.ResolvedThreads, `SELECT COUNT(*) FROM threads WHERE is_resolved = TRUE`)
-	db.Get(&stats.TotalReplies, `SELECT COUNT(*) FROM thread_replies`)
-	db.Get(&stats.TotalParticipants, `SELECT COUNT(*) FROM thread_participants`)
-
-	c.JSON(200, gin.H{
-		"threads": gin.H{
-			"total":    stats.TotalThreads,
-			"active":   stats.ActiveThreads,
-			"resolved": stats.ResolvedThreads,
-		},
-		"replies":      stats.TotalReplies,
-		"participants": stats.TotalParticipants,
-	})
-}
-
-// Kafka event publishing
-func publishEvent(event ThreadEvent) {
-	data, err := json.Marshal(event)
-	if err != nil {
-		log.Errorf("Failed to marshal event: %v", err)
-		return
-	}
-
-	go func() {
-		err := kafkaWriter.WriteMessages(context.Background(), kafka.Message{
-			Key:   []byte(event.ThreadID),
-			Value: data,
-			Headers: []kafka.Header{
-				{Key: "event_type", Value: []byte(event.Type)},
-				{Key: "channel_id", Value: []byte(event.ChannelID)},
-			},
-		})
-		if err != nil {
-			log.Errorf("Failed to publish event %s: %v", event.Type, err)
-		} else {
-			log.WithFields(logrus.Fields{
-				"event_type": event.Type,
-				"thread_id":  event.ThreadID,
-			}).Debug("Event published")
-		}
-	}()
+	log.Info("Database migrations completed")
 }
