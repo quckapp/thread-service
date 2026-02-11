@@ -79,6 +79,7 @@ func main() {
 
 	// Setup router
 	r := api.SetupRouter(db, handler, log)
+	api.RegisterExtendedRoutes(r, db)
 
 	srv := &http.Server{Addr: ":" + getEnv("PORT", "5009"), Handler: r}
 	go func() {
@@ -314,6 +315,103 @@ func runMigrations(db *sqlx.DB, log *logrus.Logger) {
 			created_at DATETIME NOT NULL,
 			INDEX idx_source (source_thread),
 			INDEX idx_target (target_thread)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_permissions (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			can_reply BOOLEAN DEFAULT TRUE,
+			can_edit BOOLEAN DEFAULT FALSE,
+			can_delete BOOLEAN DEFAULT FALSE,
+			can_pin BOOLEAN DEFAULT FALSE,
+			can_lock BOOLEAN DEFAULT FALSE,
+			can_invite BOOLEAN DEFAULT FALSE,
+			granted_by VARCHAR(36) NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			UNIQUE KEY uq_thread_user (thread_id, user_id),
+			INDEX idx_thread (thread_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_watchers (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			notify_on VARCHAR(20) DEFAULT 'all',
+			created_at DATETIME NOT NULL,
+			UNIQUE KEY uq_thread_user (thread_id, user_id),
+			INDEX idx_user (user_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS read_receipts (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			reply_id VARCHAR(36) DEFAULT '',
+			read_at DATETIME NOT NULL,
+			UNIQUE KEY uq_thread_user (thread_id, user_id),
+			INDEX idx_thread (thread_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS scheduled_messages (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			content TEXT NOT NULL,
+			scheduled_at DATETIME NOT NULL,
+			sent_at DATETIME,
+			status VARCHAR(20) DEFAULT 'pending',
+			created_at DATETIME NOT NULL,
+			INDEX idx_thread (thread_id),
+			INDEX idx_user (user_id),
+			INDEX idx_scheduled (scheduled_at, status)
+		)`,
+		`CREATE TABLE IF NOT EXISTS saved_replies (
+			id VARCHAR(36) PRIMARY KEY,
+			user_id VARCHAR(36) NOT NULL,
+			title VARCHAR(255) NOT NULL,
+			content TEXT NOT NULL,
+			shortcut VARCHAR(50) DEFAULT '',
+			use_count INT DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			INDEX idx_user (user_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_tags (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			tag VARCHAR(100) NOT NULL,
+			added_by VARCHAR(36) NOT NULL,
+			created_at DATETIME NOT NULL,
+			UNIQUE KEY uq_thread_tag (thread_id, tag),
+			INDEX idx_tag (tag)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_favorites (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			created_at DATETIME NOT NULL,
+			UNIQUE KEY uq_thread_user (thread_id, user_id),
+			INDEX idx_user (user_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS thread_pins (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			channel_id VARCHAR(36) NOT NULL,
+			pinned_by VARCHAR(36) NOT NULL,
+			pinned_at DATETIME NOT NULL,
+			UNIQUE KEY uq_thread (thread_id),
+			INDEX idx_channel (channel_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS notification_preferences (
+			id VARCHAR(36) PRIMARY KEY,
+			thread_id VARCHAR(36) NOT NULL,
+			user_id VARCHAR(36) NOT NULL,
+			muted BOOLEAN DEFAULT FALSE,
+			mute_until DATETIME,
+			desktop BOOLEAN DEFAULT TRUE,
+			mobile BOOLEAN DEFAULT TRUE,
+			email BOOLEAN DEFAULT FALSE,
+			created_at DATETIME NOT NULL,
+			UNIQUE KEY uq_thread_user (thread_id, user_id),
+			INDEX idx_user (user_id)
 		)`,
 	}
 
