@@ -1,10 +1,13 @@
 package api
 
 import (
+	"context"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
+	promotiongate "github.com/quckapp/promotion-gate-go"
 	"github.com/sirupsen/logrus"
 )
 
@@ -148,6 +151,12 @@ func SetupRouter(db *sqlx.DB, h *Handler, logger *logrus.Logger) *gin.Engine {
 		// Stats
 		api.GET("/stats", h.GetStats)
 	}
+
+	// Promotion gate
+	promoStore := promotiongate.NewSQLStore(db.DB, "")
+	_ = promoStore.Migrate(context.Background())
+	promoHandler := promotiongate.NewHandler(promoStore, "thread-service", os.Getenv("ENVIRONMENT"))
+	promoHandler.RegisterRoutes(api)
 
 	return r
 }
