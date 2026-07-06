@@ -23,5 +23,5 @@ RUN apk --no-cache add ca-certificates
 COPY --from=builder /app/main .
 EXPOSE 5009
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD wget --spider -q http://127.0.0.1:3005/health || exit 1
+    CMD wget --spider -q http://127.0.0.1:5009/health || exit 1
 CMD ["./main"]
